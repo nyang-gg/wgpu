@@ -270,7 +270,7 @@ bitflags::bitflags! {
 
 type BindTarget = u32;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 enum VertexAttribKind {
     #[default]
     Float, // glVertexAttribPointer
@@ -684,14 +684,14 @@ pub struct ShaderModule {
 
 impl crate::DynShaderModule for ShaderModule {}
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct VertexFormatDesc {
     element_count: i32,
     element_format: u32,
     attrib_kind: VertexAttribKind,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct AttributeDesc {
     location: u32,
     offset: u32,
@@ -1007,7 +1007,10 @@ enum Command {
         size: wgt::Extent3d,
     },
     InvalidateAttachments(InvalidatedAttachments),
-    SetDrawColorBuffers(u8),
+    SetDrawColorBuffers {
+        count: u8,
+        is_default: bool,
+    },
     ClearColorF {
         draw_buffer: u32,
         color: [f32; 4],
@@ -1046,6 +1049,8 @@ enum Command {
     SetAlphaToCoverage(bool),
     SetVertexAttribute {
         buffer: Option<glow::Buffer>,
+        bind_buffer: bool,
+        configure_attribute: bool,
         buffer_desc: VertexBufferDesc,
         attribute_desc: AttributeDesc,
     },
@@ -1060,6 +1065,7 @@ enum Command {
     SetBlendConstant([f32; 4]),
     SetColorTarget {
         draw_buffer_index: Option<u32>,
+        previous: Option<ColorTargetDesc>,
         desc: ColorTargetDesc,
     },
     BindBuffer {

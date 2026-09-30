@@ -1297,6 +1297,8 @@ impl crate::Device for super::Device {
         let mut num_storage_buffers = 0u8;
 
         let mut writer_flags = glsl::WriterFlags::ADJUST_COORDINATE_SPACE;
+        #[cfg(all(feature = "experimental-f16-mediump", target_arch = "wasm32"))]
+        writer_flags.insert(glsl::WriterFlags::F16_AS_MEDIUMP);
         writer_flags.set(
             glsl::WriterFlags::TEXTURE_SHADOW_LOD,
             self.shared

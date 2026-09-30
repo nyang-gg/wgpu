@@ -169,6 +169,8 @@ bitflags::bitflags! {
         /// The variable gl_PointSize is intended for a shader to write the size of the point to be rasterized. It is measured in pixels.
         /// If gl_PointSize is not written to, its value is undefined in subsequent pipe stages.
         const FORCE_POINT_SIZE = 0x20;
+        /// Experimental relaxed f16 arithmetic via GLSL ES mediump; no f16 buffer ABI.
+        const F16_AS_MEDIUMP = 0x40;
     }
 }
 

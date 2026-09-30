@@ -21,9 +21,11 @@ pub(super) struct State {
         Option<super::BufferBinding>,
     ); crate::MAX_VERTEX_BUFFERS],
     vertex_attributes: ArrayVec<super::AttributeDesc, { super::MAX_VERTEX_ATTRIBUTES }>,
+    attribute_steps: [Option<wgt::VertexStepMode>; super::MAX_VERTEX_ATTRIBUTES],
     color_targets: ArrayVec<super::ColorTargetDesc, { crate::MAX_COLOR_ATTACHMENTS }>,
     stencil: super::StencilState,
     depth_bias: wgt::DepthBiasState,
+    configured_aspects: Option<crate::FormatAspects>,
     alpha_to_coverage_enabled: bool,
     samplers: [Option<glow::Sampler>; super::MAX_SAMPLERS],
     texture_slots: [TextureSlotDesc; super::MAX_TEXTURE_SLOTS],
@@ -51,9 +53,11 @@ impl Default for State {
             index_offset: Default::default(),
             vertex_buffers: Default::default(),
             vertex_attributes: Default::default(),
+            attribute_steps: [None; super::MAX_VERTEX_ATTRIBUTES],
             color_targets: Default::default(),
             stencil: Default::default(),
             depth_bias: Default::default(),
+            configured_aspects: None,
             alpha_to_coverage_enabled: Default::default(),
             samplers: Default::default(),
             texture_slots: Default::default(),
@@ -162,6 +166,7 @@ impl super::CommandEncoder {
             }
         } else {
             let mut vbuf_mask = 0;
+            let mut bound_buffer = None;
             for attribute in self.state.vertex_attributes.iter() {
                 if self.state.dirty_vbuf_mask & (1 << attribute.buffer_index) == 0 {
                     continue;
@@ -179,11 +184,17 @@ impl super::CommandEncoder {
                     attribute_desc.offset += buffer_desc.stride * first_instance;
                 }
 
+                let step = &mut self.state.attribute_steps[attribute.location as usize];
+                let configure_attribute = *step != Some(buffer_desc.step);
+                *step = Some(buffer_desc.step);
                 self.cmd_buffer.commands.push(C::SetVertexAttribute {
                     buffer: Some(vb.raw),
+                    bind_buffer: bound_buffer != Some(vb.raw),
+                    configure_attribute,
                     buffer_desc,
                     attribute_desc,
                 });
+                bound_buffer = Some(vb.raw);
                 vbuf_mask |= 1 << attribute.buffer_index;
             }
             self.state.dirty_vbuf_mask ^= vbuf_mask;
@@ -640,9 +651,19 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
         if !rendering_to_external_framebuffer {
             // set the draw buffers and states
-            self.cmd_buffer
-                .commands
-                .push(C::SetDrawColorBuffers(desc.color_attachments.len() as u8));
+            self.cmd_buffer.commands.push(C::SetDrawColorBuffers {
+                count: desc.color_attachments.len() as u8,
+                is_default: desc
+                    .color_attachments
+                    .first()
+                    .and_then(Option::as_ref)
+                    .is_some_and(|at| {
+                        matches!(
+                            at.target.view.inner,
+                            super::TextureInner::DefaultRenderbuffer
+                        )
+                    }),
+            });
         }
 
         // issue the clears
@@ -718,12 +739,14 @@ impl crate::CommandEncoder for super::CommandEncoder {
         self.state.dirty_vbuf_mask = 0;
         self.state.active_first_instance = 0;
         self.state.color_targets.clear();
+        self.state.configured_aspects = None;
         for vat in &self.state.vertex_attributes {
             self.cmd_buffer
                 .commands
                 .push(C::UnsetVertexAttribute(vat.location));
         }
         self.state.vertex_attributes.clear();
+        self.state.attribute_steps.fill(None);
         self.state.primitive = super::PrimitiveState::default();
 
         if let Some(query) = self.state.end_of_pass_timestamp.take() {
@@ -883,22 +906,27 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 // set the layout
                 self.cmd_buffer.commands.push(C::SetVertexAttribute {
                     buffer: None,
+                    bind_buffer: true,
+                    configure_attribute: true,
                     buffer_desc: vb.clone(),
                     attribute_desc: vat.clone(),
                 });
             }
-        } else {
+        } else if self.state.vertex_attributes[..] != pipeline.vertex_attributes[..] {
             for vat in &self.state.vertex_attributes {
-                self.cmd_buffer
-                    .commands
-                    .push(C::UnsetVertexAttribute(vat.location));
+                if !pipeline
+                    .vertex_attributes
+                    .iter()
+                    .any(|next| next.location == vat.location)
+                {
+                    self.cmd_buffer
+                        .commands
+                        .push(C::UnsetVertexAttribute(vat.location));
+                    self.state.attribute_steps[vat.location as usize] = None;
+                }
             }
             self.state.vertex_attributes.clear();
-
-            self.state.dirty_vbuf_mask = 0;
-            // copy vertex attributes
-            for vat in pipeline.vertex_attributes.iter() {
-                //Note: we can invalidate more carefully here.
+            for vat in &pipeline.vertex_attributes {
                 self.state.dirty_vbuf_mask |= 1 << vat.buffer_index;
                 self.state.vertex_attributes.push(vat.clone());
             }
@@ -973,9 +1001,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 });
             }
         }
-        self.cmd_buffer
-            .commands
-            .push(C::ConfigureDepthStencil(aspects));
+        if self.state.configured_aspects != Some(aspects) {
+            self.cmd_buffer
+                .commands
+                .push(C::ConfigureDepthStencil(aspects));
+            self.state.configured_aspects = Some(aspects);
+        }
 
         // set multisampling state
         if pipeline.alpha_to_coverage_enabled != self.state.alpha_to_coverage_enabled {
@@ -996,12 +1027,19 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 for (index, ct) in pipeline.color_targets.iter().enumerate() {
                     self.cmd_buffer.commands.push(C::SetColorTarget {
                         draw_buffer_index: Some(index as u32),
+                        previous: None,
                         desc: ct.clone(),
                     });
                 }
             } else {
                 self.cmd_buffer.commands.push(C::SetColorTarget {
                     draw_buffer_index: None,
+                    previous: self
+                        .state
+                        .color_targets
+                        .first()
+                        .filter(|first| self.state.color_targets.iter().all(|ct| ct == *first))
+                        .cloned(),
                     desc: pipeline.color_targets.first().cloned().unwrap_or_default(),
                 });
             }
@@ -1341,5 +1379,258 @@ impl crate::CommandEncoder for super::CommandEncoder {
         _intersection_group_data: crate::PipelineGroupData<super::Buffer>,
     ) {
         unimplemented!()
+    }
+}
+
+#[cfg(all(test, not(webgl)))]
+mod vertex_state_tests {
+    use super::*;
+    use crate::CommandEncoder as _;
+    use alloc::{sync::Arc, vec};
+    use core::num::NonZeroU32;
+
+    fn encoder() -> super::super::CommandEncoder {
+        let counters = Arc::new(wgt::HalCounters::default());
+        counters.command_encoders.add(1);
+        super::super::CommandEncoder {
+            cmd_buffer: Default::default(),
+            state: Default::default(),
+            private_caps: super::super::PrivateCapabilities::empty(),
+            counters,
+        }
+    }
+
+    fn pipeline(attributes: &[(u32, u32)], stride: u32) -> super::super::RenderPipeline {
+        use super::super::*;
+        RenderPipeline {
+            inner: Arc::new(PipelineInner {
+                program: glow::NativeProgram(NonZeroU32::new(1).unwrap()),
+                sampler_map: [None; MAX_SAMPLERS],
+                first_instance_location: None,
+                immediates_descs: ArrayVec::new(),
+                clip_distance_count: 0,
+            }),
+            primitive: Default::default(),
+            vertex_buffers: vec![Some(VertexBufferDesc {
+                step: wgt::VertexStepMode::Instance,
+                stride,
+            })]
+            .into_boxed_slice(),
+            vertex_attributes: attributes
+                .iter()
+                .map(|&(location, offset)| AttributeDesc {
+                    location,
+                    offset,
+                    buffer_index: 0,
+                    ..Default::default()
+                })
+                .collect(),
+            color_targets: Box::default(),
+            depth: None,
+            depth_bias: Default::default(),
+            stencil: None,
+            alpha_to_coverage_enabled: false,
+        }
+    }
+
+    #[test]
+    fn render_pass_routes_draw_buffers_to_its_actual_framebuffer() {
+        use super::super::*;
+        let mut enc = encoder();
+        for is_default in [false, true, false] {
+            let view = TextureView {
+                inner: if is_default {
+                    TextureInner::DefaultRenderbuffer
+                } else {
+                    TextureInner::Texture {
+                        raw: glow::NativeTexture(NonZeroU32::new(1).unwrap()),
+                        target: glow::TEXTURE_2D,
+                    }
+                },
+                aspects: crate::FormatAspects::COLOR,
+                mip_levels: 0..1,
+                array_layers: 0..1,
+                format: wgt::TextureFormat::Rgba8Unorm,
+            };
+            enc.cmd_buffer.commands.clear();
+            unsafe {
+                enc.begin_render_pass(&crate::RenderPassDescriptor {
+                    label: None,
+                    extent: wgt::Extent3d {
+                        width: 4,
+                        height: 4,
+                        depth_or_array_layers: 1,
+                    },
+                    sample_count: 1,
+                    color_attachments: &[Some(crate::ColorAttachment {
+                        target: crate::Attachment {
+                            view: &view,
+                            usage: wgt::TextureUses::COLOR_TARGET,
+                        },
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: crate::AttachmentOps::LOAD_CLEAR | crate::AttachmentOps::STORE,
+                        clear_value: wgt::Color::TRANSPARENT,
+                    })],
+                    depth_stencil_attachment: None,
+                    multiview_mask: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+            }
+            .unwrap();
+            assert!(enc
+                .cmd_buffer
+                .commands
+                .iter()
+                .any(|command| matches!(command,
+                C::SetDrawColorBuffers { is_default: actual, .. } if *actual == is_default)));
+            assert!(enc
+                .cmd_buffer
+                .commands
+                .iter()
+                .any(|command| matches!(command,
+                C::ResetFramebuffer { is_default: actual } if *actual == is_default)));
+            unsafe { enc.end_render_pass() };
+        }
+    }
+
+    #[test]
+    fn pipeline_depth_enable_changes_survive_state_reuse() {
+        use super::super::*;
+        let mut enc = encoder();
+        let mut pipe = pipeline(&[(0, 0)], 16);
+        unsafe { enc.set_render_pipeline(&pipe) };
+        enc.cmd_buffer.commands.clear();
+        unsafe { enc.set_render_pipeline(&pipe) };
+        assert!(!enc
+            .cmd_buffer
+            .commands
+            .iter()
+            .any(|c| matches!(c, C::ConfigureDepthStencil(_))));
+        pipe.depth = Some(DepthState {
+            function: glow::LESS,
+            mask: true,
+        });
+        unsafe { enc.set_render_pipeline(&pipe) };
+        assert!(enc.cmd_buffer.commands.iter().any(
+            |c| matches!(c, C::ConfigureDepthStencil(a) if a.contains(crate::FormatAspects::DEPTH))
+        ));
+        enc.cmd_buffer.commands.clear();
+        pipe.depth = None;
+        unsafe { enc.set_render_pipeline(&pipe) };
+        assert!(enc
+            .cmd_buffer
+            .commands
+            .iter()
+            .any(|c| matches!(c, C::ConfigureDepthStencil(a) if a.is_empty())));
+        unsafe { enc.end_render_pass() };
+        assert!(enc.state.configured_aspects.is_none());
+    }
+
+    #[test]
+    fn pipeline_reuse_preserves_dirty_bindings_and_detects_layout_changes() {
+        let mut enc = encoder();
+        let first = pipeline(&[(0, 0), (1, 8)], 16);
+        unsafe { enc.set_render_pipeline(&first) };
+        enc.state.dirty_vbuf_mask = 0;
+        enc.cmd_buffer.commands.clear();
+        unsafe { enc.set_render_pipeline(&first) };
+        assert_eq!(enc.state.dirty_vbuf_mask, 0);
+        assert!(!enc
+            .cmd_buffer
+            .commands
+            .iter()
+            .any(|c| matches!(c, C::UnsetVertexAttribute(_))));
+        enc.state.dirty_vbuf_mask = 1;
+        unsafe { enc.set_render_pipeline(&first) };
+        assert_eq!(enc.state.dirty_vbuf_mask, 1);
+        enc.state.dirty_vbuf_mask = 0;
+        unsafe { enc.set_render_pipeline(&pipeline(&[(0, 0), (1, 8)], 24)) };
+        assert_eq!(enc.state.dirty_vbuf_mask, 1);
+        enc.state.dirty_vbuf_mask = 0;
+        enc.cmd_buffer.commands.clear();
+        unsafe { enc.set_render_pipeline(&pipeline(&[(1, 12)], 24)) };
+        assert_eq!(enc.state.dirty_vbuf_mask, 1);
+        assert!(enc
+            .cmd_buffer
+            .commands
+            .iter()
+            .any(|c| matches!(c, C::UnsetVertexAttribute(0))));
+        assert!(!enc
+            .cmd_buffer
+            .commands
+            .iter()
+            .any(|c| matches!(c, C::UnsetVertexAttribute(1))));
+    }
+
+    #[test]
+    fn rebind_groups_bind_alternating_buffers_and_apply_instance_offsets() {
+        use super::super::*;
+        let mut enc = encoder();
+        for i in 0..2 {
+            enc.state.vertex_buffers[i] = (
+                Some(VertexBufferDesc {
+                    step: wgt::VertexStepMode::Instance,
+                    stride: 16,
+                }),
+                Some(BufferBinding {
+                    raw: glow::NativeBuffer(NonZeroU32::new(i as u32 + 1).unwrap()),
+                    offset: 32,
+                }),
+            );
+        }
+        for (location, buffer_index) in [0, 0, 1, 0].into_iter().enumerate() {
+            enc.state.vertex_attributes.push(AttributeDesc {
+                location: location as u32,
+                buffer_index,
+                offset: 4,
+                ..Default::default()
+            });
+        }
+        for iteration in 0..2 {
+            enc.cmd_buffer.commands.clear();
+            enc.state.dirty_vbuf_mask = 3;
+            enc.rebind_vertex_data(2);
+            let bindings: Vec<_> = enc
+                .cmd_buffer
+                .commands
+                .iter()
+                .filter_map(|c| match c {
+                    C::SetVertexAttribute {
+                        bind_buffer,
+                        configure_attribute,
+                        attribute_desc,
+                        ..
+                    } => {
+                        assert_eq!(*configure_attribute, iteration == 0);
+                        assert_eq!(attribute_desc.offset, 68);
+                        Some(*bind_buffer)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(bindings, [true, false, true, true]);
+            assert_eq!(enc.state.dirty_vbuf_mask, 0);
+        }
+        enc.cmd_buffer.commands.clear();
+        enc.rebind_vertex_data(2);
+        assert!(enc.cmd_buffer.commands.is_empty());
+        enc.state.vertex_buffers[0].0.as_mut().unwrap().step = wgt::VertexStepMode::Vertex;
+        enc.state.dirty_vbuf_mask = 1;
+        enc.rebind_vertex_data(2);
+        for command in &enc.cmd_buffer.commands {
+            if let C::SetVertexAttribute {
+                configure_attribute,
+                attribute_desc,
+                ..
+            } = command
+            {
+                assert!(*configure_attribute);
+                assert_eq!(attribute_desc.offset, 36);
+            }
+        }
+        unsafe { enc.end_render_pass() };
+        assert!(enc.state.attribute_steps.iter().all(Option::is_none));
     }
 }

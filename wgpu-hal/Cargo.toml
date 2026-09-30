@@ -43,6 +43,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 [lib]
 
 [features]
+experimental-f16-mediump = []
 ########################
 ### Backend Features ###
 ########################

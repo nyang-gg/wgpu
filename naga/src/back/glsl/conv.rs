@@ -45,7 +45,7 @@ pub(in crate::back::glsl) const fn glsl_scalar(
             _ => return Err(Error::UnsupportedScalar(scalar)),
         },
         Sk::Float => match scalar.width {
-            4 => ScalarString {
+            2 | 4 => ScalarString {
                 prefix: "",
                 full: "float",
             },

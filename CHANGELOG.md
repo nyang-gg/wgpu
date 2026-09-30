@@ -1,3 +1,9 @@
+## Local experiment
+
+Opt-in `experimental-f16-mediump` WebGL lowering maps shader-local f16 to GLSL ES mediump. This relaxes f16 numerical semantics and rejects f16 buffer ABI and bitcasts in f16 modules.
+
+The GLES command encoder retains compatible vertex layouts, avoids redundant buffer/attribute/depth/blend state changes and absent-uniform writes, and selects BACK instead of COLOR_ATTACHMENT0 for imported default framebuffers.
+
 # Change Log
 
 <!--
