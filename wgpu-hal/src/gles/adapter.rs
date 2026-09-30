@@ -486,6 +486,8 @@ impl super::Adapter {
             | wgt::Features::IMMEDIATES
             | wgt::Features::DEPTH32FLOAT_STENCIL8
             | wgt::Features::PASSTHROUGH_SHADERS;
+        #[cfg(all(feature = "experimental-f16-mediump", target_arch = "wasm32"))]
+        features.insert(wgt::Features::SHADER_F16);
         features.set(
             wgt::Features::TEXTURE_FORMAT_16BIT_NORM,
             supports_16bit_norm,
