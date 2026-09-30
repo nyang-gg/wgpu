@@ -1007,7 +1007,11 @@ enum Command {
         size: wgt::Extent3d,
     },
     InvalidateAttachments(InvalidatedAttachments),
-    SetDrawColorBuffers(u8),
+    SetDrawColorBuffers {
+        count: u8,
+        /// The default framebuffer only accepts `BACK` (or `NONE`) in `glDrawBuffers`.
+        is_default: bool,
+    },
     ClearColorF {
         draw_buffer: u32,
         color: [f32; 4],

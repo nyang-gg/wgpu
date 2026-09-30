@@ -1199,10 +1199,16 @@ impl super::Queue {
                     unsafe { gl.invalidate_framebuffer(glow::DRAW_FRAMEBUFFER, list) };
                 }
             }
-            C::SetDrawColorBuffers(count) => {
+            C::SetDrawColorBuffers { count, is_default } => {
                 self.draw_buffer_count.store(count, Ordering::Relaxed);
                 let indices = (0..count as u32)
-                    .map(|i| glow::COLOR_ATTACHMENT0 + i)
+                    .map(|i| {
+                        if is_default {
+                            glow::BACK
+                        } else {
+                            glow::COLOR_ATTACHMENT0 + i
+                        }
+                    })
                     .collect::<ArrayVec<_, { crate::MAX_COLOR_ATTACHMENTS }>>();
                 unsafe { gl.draw_buffers(&indices) };
             }

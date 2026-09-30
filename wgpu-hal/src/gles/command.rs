@@ -537,19 +537,21 @@ impl crate::CommandEncoder for super::CommandEncoder {
         // `COLOR_ATTACHMENT0` to `COLOR_ATTACHMENT31` gives 32 possible color attachments.
         assert!(desc.color_attachments.len() <= 32);
 
-        match desc
-            .color_attachments
-            .first()
-            .filter(|at| at.is_some())
-            .and_then(|at| at.as_ref().map(|at| &at.target.view.inner))
-        {
+        let is_default_framebuffer = matches!(
+            desc.color_attachments
+                .first()
+                .and_then(|at| at.as_ref())
+                .map(|at| &at.target.view.inner),
+            Some(&super::TextureInner::DefaultRenderbuffer)
+        );
+        match is_default_framebuffer {
             // default framebuffer (provided externally)
-            Some(&super::TextureInner::DefaultRenderbuffer) => {
+            true => {
                 self.cmd_buffer
                     .commands
                     .push(C::ResetFramebuffer { is_default: true });
             }
-            _ => {
+            false => {
                 // set the framebuffer
                 self.cmd_buffer
                     .commands
@@ -640,9 +642,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
         if !rendering_to_external_framebuffer {
             // set the draw buffers and states
-            self.cmd_buffer
-                .commands
-                .push(C::SetDrawColorBuffers(desc.color_attachments.len() as u8));
+            self.cmd_buffer.commands.push(C::SetDrawColorBuffers {
+                count: desc.color_attachments.len() as u8,
+                is_default: is_default_framebuffer,
+            });
         }
 
         // issue the clears
@@ -1341,5 +1344,74 @@ impl crate::CommandEncoder for super::CommandEncoder {
         _intersection_group_data: crate::PipelineGroupData<super::Buffer>,
     ) {
         unimplemented!()
+    }
+}
+
+#[cfg(all(test, not(webgl)))]
+mod default_framebuffer_tests {
+    use super::*;
+    use crate::CommandEncoder as _;
+    use core::num::NonZeroU32;
+
+    #[test]
+    fn render_pass_routes_draw_buffers_to_its_actual_framebuffer() {
+        use super::super::*;
+        let counters = Arc::new(wgt::HalCounters::default());
+        counters.command_encoders.add(1);
+        let mut enc = CommandEncoder {
+            cmd_buffer: Default::default(),
+            state: Default::default(),
+            private_caps: PrivateCapabilities::empty(),
+            counters,
+        };
+        for is_default in [false, true, false] {
+            let view = TextureView {
+                inner: if is_default {
+                    TextureInner::DefaultRenderbuffer
+                } else {
+                    TextureInner::Texture {
+                        raw: glow::NativeTexture(NonZeroU32::new(1).unwrap()),
+                        target: glow::TEXTURE_2D,
+                    }
+                },
+                aspects: crate::FormatAspects::COLOR,
+                mip_levels: 0..1,
+                array_layers: 0..1,
+                format: wgt::TextureFormat::Rgba8Unorm,
+            };
+            enc.cmd_buffer.commands.clear();
+            unsafe {
+                enc.begin_render_pass(&crate::RenderPassDescriptor {
+                    label: None,
+                    extent: wgt::Extent3d {
+                        width: 4,
+                        height: 4,
+                        depth_or_array_layers: 1,
+                    },
+                    sample_count: 1,
+                    color_attachments: &[Some(crate::ColorAttachment {
+                        target: crate::Attachment {
+                            view: &view,
+                            usage: wgt::TextureUses::COLOR_TARGET,
+                        },
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: crate::AttachmentOps::LOAD_CLEAR | crate::AttachmentOps::STORE,
+                        clear_value: wgt::Color::TRANSPARENT,
+                    })],
+                    depth_stencil_attachment: None,
+                    multiview_mask: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+            }
+            .unwrap();
+            let commands = &enc.cmd_buffer.commands;
+            assert!(commands.iter().any(|c| matches!(c,
+                C::SetDrawColorBuffers { is_default: actual, .. } if *actual == is_default)));
+            assert!(commands.iter().any(|c| matches!(c,
+                C::ResetFramebuffer { is_default: actual } if *actual == is_default)));
+            unsafe { enc.end_render_pass() };
+        }
     }
 }
