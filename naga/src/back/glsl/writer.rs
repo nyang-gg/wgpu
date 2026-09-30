@@ -68,6 +68,94 @@ impl<'a, W: Write> Writer<'a, W> {
             return Err(Error::VersionNotSupported);
         }
 
+        let expression_has_half = |expr: &crate::Expression| {
+            matches!(
+                expr,
+                crate::Expression::Literal(crate::Literal::F16(_))
+                    | crate::Expression::As {
+                        kind: crate::ScalarKind::Float,
+                        convert: Some(2),
+                        ..
+                    }
+            )
+        };
+        let half_types = module
+            .types
+            .iter()
+            .any(|(_, ty)| ty.inner.scalar() == Some(crate::Scalar::F16))
+            || module
+                .global_expressions
+                .iter()
+                .any(|(_, expr)| expression_has_half(expr))
+            || module
+                .functions
+                .iter()
+                .map(|(_, fun)| fun)
+                .chain(module.entry_points.iter().map(|ep| &ep.function))
+                .any(|fun| {
+                    fun.expressions
+                        .iter()
+                        .any(|(_, expr)| expression_has_half(expr))
+                });
+        if half_types {
+            if !options.version.is_es()
+                || !options.writer_flags.contains(WriterFlags::F16_AS_MEDIUMP)
+            {
+                return Err(Error::Custom(
+                    "f16 requires experimental GLSL ES mediump lowering".into(),
+                ));
+            }
+            fn contains_half(module: &crate::Module, ty: Handle<crate::Type>) -> bool {
+                let inner = &module.types[ty].inner;
+                inner.scalar() == Some(crate::Scalar::F16)
+                    || match *inner {
+                        TypeInner::Array { base, .. } | TypeInner::Pointer { base, .. } => {
+                            contains_half(module, base)
+                        }
+                        TypeInner::Struct { ref members, .. } => {
+                            members.iter().any(|m| contains_half(module, m.ty))
+                        }
+                        _ => false,
+                    }
+            }
+            for (_, global) in module.global_variables.iter() {
+                if !matches!(global.space, crate::AddressSpace::Private)
+                    && contains_half(module, global.ty)
+                {
+                    return Err(Error::Custom(
+                        "mediump lowering does not support f16 buffer/workgroup ABI".into(),
+                    ));
+                }
+            }
+            for (_, ty) in module.types.iter() {
+                if let TypeInner::Pointer { base, space } = ty.inner {
+                    if !matches!(
+                        space,
+                        crate::AddressSpace::Function | crate::AddressSpace::Private
+                    ) && contains_half(module, base)
+                    {
+                        return Err(Error::Custom(
+                            "mediump lowering does not support f16 buffer pointers".into(),
+                        ));
+                    }
+                }
+            }
+            for fun in module
+                .functions
+                .iter()
+                .map(|(_, fun)| fun)
+                .chain(module.entry_points.iter().map(|ep| &ep.function))
+            {
+                for (_, expr) in fun.expressions.iter() {
+                    if matches!(expr, crate::Expression::As { convert: None, .. }) {
+                        return Err(Error::Custom(
+                            "mediump lowering does not support bitcasts in f16 modules".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
         // Try to find the entry point and corresponding index
         let ep_idx = module
             .entry_points
@@ -543,6 +631,23 @@ impl<'a, W: Write> Writer<'a, W> {
         Ok(())
     }
 
+    fn write_decl_value_type(&mut self, inner: &TypeInner) -> BackendResult {
+        if inner.scalar() == Some(crate::Scalar::F16) {
+            write!(self.out, "mediump ")?;
+        }
+        self.write_value_type(inner)
+    }
+
+    fn write_decl_type(&mut self, ty: Handle<crate::Type>) -> BackendResult {
+        match self.module.types[ty].inner {
+            TypeInner::Array { base, .. } | TypeInner::Pointer { base, .. } => {
+                self.write_decl_type(base)
+            }
+            TypeInner::Struct { .. } => self.write_type(ty),
+            ref inner => self.write_decl_value_type(inner),
+        }
+    }
+
     /// Helper method used to write non image/sampler types
     ///
     /// # Notes
@@ -756,7 +861,7 @@ impl<'a, W: Write> Writer<'a, W> {
         handle: Handle<crate::GlobalVariable>,
         global: &crate::GlobalVariable,
     ) -> BackendResult {
-        self.write_type(global.ty)?;
+        self.write_decl_type(global.ty)?;
         write!(self.out, " ")?;
         self.write_global_name(handle, global)?;
 
@@ -824,7 +929,7 @@ impl<'a, W: Write> Writer<'a, W> {
                 // of the interface block. Since the interface block is
                 // anonymous, this becomes visible in the global scope.
                 write!(self.out, "{{ ")?;
-                self.write_type(global.ty)?;
+                self.write_decl_type(global.ty)?;
                 write!(self.out, " ")?;
                 self.write_global_name(handle, global)?;
                 if let TypeInner::Array { base, size, .. } = self.module.types[global.ty].inner {
@@ -1172,7 +1277,7 @@ impl<'a, W: Write> Writer<'a, W> {
 
         // Write the type
         // `write_type` adds no leading or trailing spaces
-        self.write_type(ty)?;
+        self.write_decl_type(ty)?;
 
         // Finally write the global name and end the global with a `;` and a newline
         // Leading space is important
@@ -1233,7 +1338,7 @@ impl<'a, W: Write> Writer<'a, W> {
         if let back::FunctionType::EntryPoint(_) = ctx.ty {
             write!(self.out, "void")?;
         } else if let Some(ref result) = func.result {
-            self.write_type(result.ty)?;
+            self.write_decl_type(result.ty)?;
             if let TypeInner::Array { base, size, .. } = self.module.types[result.ty].inner {
                 self.write_array_size(base, size)?
             }
@@ -1292,11 +1397,11 @@ impl<'a, W: Write> Writer<'a, W> {
                 TypeInner::Pointer { base, .. } => {
                     // write parameter qualifiers
                     write!(this.out, "inout ")?;
-                    this.write_type(base)?;
+                    this.write_decl_type(base)?;
                 }
                 // All other types are written by `write_type`
                 _ => {
-                    this.write_type(arg.ty)?;
+                    this.write_decl_type(arg.ty)?;
                 }
             }
 
@@ -1334,13 +1439,13 @@ impl<'a, W: Write> Writer<'a, W> {
             let stage = self.module.entry_points[ep_index as usize].stage;
             for (index, arg) in func.arguments.iter().enumerate() {
                 write!(self.out, "{}", back::INDENT)?;
-                self.write_type(arg.ty)?;
+                self.write_decl_type(arg.ty)?;
                 let name = &self.names[&NameKey::EntryPointArgument(ep_index, index as u32)];
                 write!(self.out, " {name}")?;
                 write!(self.out, " = ")?;
                 match self.module.types[arg.ty].inner {
                     TypeInner::Struct { ref members, .. } => {
-                        self.write_type(arg.ty)?;
+                        self.write_decl_type(arg.ty)?;
                         write!(self.out, "(")?;
                         for (index, member) in members.iter().enumerate() {
                             let varying_name = VaryingName {
@@ -1375,7 +1480,7 @@ impl<'a, W: Write> Writer<'a, W> {
             // Write indentation (only for readability) and the type
             // `write_type` adds no trailing space
             write!(self.out, "{}", back::INDENT)?;
-            self.write_type(local.ty)?;
+            self.write_decl_type(local.ty)?;
 
             // Write the local name
             // The leading space is important
@@ -1477,7 +1582,7 @@ impl<'a, W: Write> Writer<'a, W> {
     fn write_global_constant(&mut self, handle: Handle<crate::Constant>) -> BackendResult {
         write!(self.out, "const ")?;
         let constant = &self.module.constants[handle];
-        self.write_type(constant.ty)?;
+        self.write_decl_type(constant.ty)?;
         let name = &self.names[&NameKey::Constant(handle)];
         write!(self.out, " {name}")?;
         if let TypeInner::Array { base, size, .. } = self.module.types[constant.ty].inner {
@@ -1554,7 +1659,7 @@ impl<'a, W: Write> Writer<'a, W> {
                     size,
                     stride: _,
                 } => {
-                    self.write_type(base)?;
+                    self.write_decl_type(base)?;
                     write!(
                         self.out,
                         " {}",
@@ -1568,7 +1673,7 @@ impl<'a, W: Write> Writer<'a, W> {
                 _ => {
                     // Write the member type
                     // Adds no trailing space
-                    self.write_type(member.ty)?;
+                    self.write_decl_type(member.ty)?;
 
                     // Write the member name and put a semicolon
                     // The leading space is important
@@ -1614,7 +1719,14 @@ impl<'a, W: Write> Writer<'a, W> {
                         // Otherwise, we could accidentally write variable name instead of full expression.
                         // Also, we use sanitized names! It defense backend from generating variable with name from reserved keywords.
                         Some(self.namer.call(name))
-                    } else if self.need_bake_expressions.contains(&handle) {
+                    } else if self.need_bake_expressions.contains(&handle)
+                        || (self
+                            .options
+                            .writer_flags
+                            .contains(WriterFlags::F16_AS_MEDIUMP)
+                            && ctx.resolve_type(handle, &self.module.types).scalar()
+                                == Some(crate::Scalar::F16))
+                    {
                         Some(Baked(handle).to_string())
                     } else {
                         None
@@ -2043,7 +2155,7 @@ impl<'a, W: Write> Writer<'a, W> {
                 if let Some(expr) = result {
                     let name = Baked(expr).to_string();
                     let result = self.module.functions[function].result.as_ref().unwrap();
-                    self.write_type(result.ty)?;
+                    self.write_decl_type(result.ty)?;
                     write!(self.out, " {name}")?;
                     if let TypeInner::Array { base, size, .. } = self.module.types[result.ty].inner
                     {
@@ -2081,7 +2193,7 @@ impl<'a, W: Write> Writer<'a, W> {
                     } => {
                         let result_handle = result.expect("CompareExchange must have a result");
                         let res_name = Baked(result_handle).to_string();
-                        self.write_type(ctx.info[result_handle].ty.handle().unwrap())?;
+                        self.write_decl_type(ctx.info[result_handle].ty.handle().unwrap())?;
                         write!(self.out, " {res_name};")?;
                         write!(self.out, " {res_name}.old_value = atomicCompSwap(")?;
                         self.write_expr(pointer, ctx)?;
@@ -2102,7 +2214,7 @@ impl<'a, W: Write> Writer<'a, W> {
                     _ => {
                         if let Some(result) = result {
                             let res_name = Baked(result).to_string();
-                            self.write_type(ctx.info[result].ty.handle().unwrap())?;
+                            self.write_decl_type(ctx.info[result].ty.handle().unwrap())?;
                             write!(self.out, " {res_name} = ")?;
                             self.named_expressions.insert(result, res_name);
                         }
@@ -2135,7 +2247,7 @@ impl<'a, W: Write> Writer<'a, W> {
                 write!(self.out, "{level}")?;
                 let res_name = Baked(result).to_string();
                 let res_ty = ctx.info[result].ty.inner_with(&self.module.types);
-                self.write_value_type(res_ty)?;
+                self.write_decl_value_type(res_ty)?;
                 write!(self.out, " {res_name} = ")?;
                 self.named_expressions.insert(result, res_name);
 
@@ -2155,7 +2267,7 @@ impl<'a, W: Write> Writer<'a, W> {
                 write!(self.out, "{level}")?;
                 let res_name = Baked(result).to_string();
                 let res_ty = ctx.info[result].ty.inner_with(&self.module.types);
-                self.write_value_type(res_ty)?;
+                self.write_decl_value_type(res_ty)?;
                 write!(self.out, " {res_name} = ")?;
                 self.named_expressions.insert(result, res_name);
 
@@ -2212,7 +2324,7 @@ impl<'a, W: Write> Writer<'a, W> {
                 write!(self.out, "{level}")?;
                 let res_name = Baked(result).to_string();
                 let res_ty = ctx.info[result].ty.inner_with(&self.module.types);
-                self.write_value_type(res_ty)?;
+                self.write_decl_value_type(res_ty)?;
                 write!(self.out, " {res_name} = ")?;
                 self.named_expressions.insert(result, res_name);
 
@@ -2334,9 +2446,7 @@ impl<'a, W: Write> Writer<'a, W> {
                     // decimal part even it's zero which is needed for a valid glsl float constant
                     crate::Literal::F64(value) => write!(self.out, "{value:?}LF")?,
                     crate::Literal::F32(value) => write!(self.out, "{value:?}")?,
-                    crate::Literal::F16(_) => {
-                        return Err(Error::Custom("GLSL has no 16-bit float type".into()));
-                    }
+                    crate::Literal::F16(value) => write!(self.out, "{:?}", value.to_f32())?,
                     // Unsigned integers need a `u` at the end
                     //
                     // While `core` doesn't necessarily need it, it's allowed and since `es` needs it we
@@ -4343,11 +4453,11 @@ impl<'a, W: Write> Writer<'a, W> {
                     write!(self.out, "{ty_name}")?;
                 }
                 _ => {
-                    self.write_type(ty_handle)?;
+                    self.write_decl_type(ty_handle)?;
                 }
             },
             proc::TypeResolution::Value(ref inner) => {
-                self.write_value_type(inner)?;
+                self.write_decl_value_type(inner)?;
             }
         }
 
